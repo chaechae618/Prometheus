@@ -1,0 +1,77 @@
+# 0. 필수 라이브러리 설치
+!pip install --quiet transformers pillow torch torchvision
+
+# 1. 드라이브 마운트 (데이터가 Drive에 있다면)
+from google.colab import drive
+drive.mount('/content/drive')
+
+# 2. 라이브러리 임포트
+import os
+from PIL import Image, ImageDraw
+import torch
+from transformers import OwlViTProcessor, OwlViTForObjectDetection
+
+# 3. 모델 및 프로세서 로드
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+processor = OwlViTProcessor.from_pretrained("google/owlvit-base-patch32")
+model     = OwlViTForObjectDetection.from_pretrained("google/owlvit-base-patch32").to(device)
+
+# 4. 클래스(라벨) 리스트 준비
+#   archive (30) 폴더 바로 아래에 있는 폴더명이 곧 클래스명이므로, 이를 불러옵니다.
+base_path = "/content/drive/MyDrive/prometheus/archive (30)"
+labels = sorted([
+    d for d in os.listdir(base_path)
+    if os.path.isdir(os.path.join(base_path, d))
+])
+print(f"✔ 클래스 수: {len(labels)}")
+
+# 5. Open-Vocabulary 탐지 함수 정의
+def owlvit_detect(img_pil, queries, threshold=0.3):
+    inputs = processor(text=queries, images=img_pil, return_tensors="pt").to(device)
+    outputs = model(**inputs)
+    target_sizes = torch.tensor([img_pil.size[::-1]]).to(device)  # (H, W)
+    results = processor.post_process_object_detection(
+        outputs, threshold=threshold, target_sizes=target_sizes
+    )[0]
+    dets = []
+    for score, idx, box in zip(results["scores"], results["labels"], results["boxes"]):
+        dets.append({
+            "label": queries[idx],
+            "score": float(score.cpu()),
+            "box": [float(x) for x in box.cpu()]
+        })
+    return dets
+
+# 6. 결과를 저장할 디렉터리 및 CSV 준비
+output_dir = "/content/drive/MyDrive/ovd_results"
+os.makedirs(output_dir, exist_ok=True)
+csv_path = os.path.join(output_dir, "ovd_predictions.csv")
+
+# 7. archive(30) 아래 각 클래스 폴더의 테스트 이미지(라벨링 제외한 나머지) 순회
+with open(csv_path, "w", newline="") as csvfile:
+    writer = csv.writer(csvfile)
+    writer.writerow(["class_folder","image_name","pred_label","score","x0","y0","x1","y1"])
+
+    for cls in labels:
+        cls_folder = os.path.join(base_path, cls, cls)
+        if not os.path.isdir(cls_folder):
+            cls_folder = os.path.join(base_path, cls)
+        # txt 라벨링된 30장을 제외하고 jpg만 남긴다고 가정
+        all_files = sorted(os.listdir(cls_folder))
+        imgs = [f for f in all_files if f.lower().endswith(".jpg")]
+        # 만약 paired 리스트가 필요하면 이전 스크립트처럼 .txt와 매칭해서 필터링하세요.
+        for img_name in imgs:
+            img_path = os.path.join(cls_folder, img_name)
+            img = Image.open(img_path).convert("RGB")
+            dets = owlvit_detect(img, labels, threshold=0.25)
+            for d in dets:
+                x0,y0,x1,y1 = d["box"]
+                writer.writerow([
+                    cls, img_name,
+                    d["label"],
+                    f"{d['score']:.4f}",
+                    f"{x0:.1f}", f"{y0:.1f}", f"{x1:.1f}", f"{y1:.1f}"
+                ])
+print("✅ 모든 이미지에 대한 Open-Vocabulary 예측이", csv_path, "에 저장되었습니다.")
+
